@@ -4,7 +4,11 @@
 # Track specific directories
 !.gitignore
 !./**
-!LORA_TEMPLATE
+!LORA_TEMPLATE/
+!LORA_TEMPLATE/**
+!LORA_TEMPLATE/dataset
+!LORA_TEMPLATE/cache_directory
+!LORA_TEMPLATE/logs
 !cache_vae
 !cache_text_encoder
 !lora_config_loader.py

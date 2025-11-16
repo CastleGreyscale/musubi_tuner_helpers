@@ -1,0 +1,178 @@
+# ============================================
+# Unified LoRA Project Configuration
+# All scripts read from this single file
+# ============================================
+
+[project]
+name = "LORANAME"
+description = "DISCRITION"
+
+[paths]
+# These reference your fish env vars - scripts will expand them
+models_root = "${COMFYUI_MODELS_ROOT}" # Path to or Models 
+projects_root = "${LORA_PROJECTS_ROOT}" # Where you stage your lora datasets root/LORANAME
+musubi_tuner_root = "${MUSUBI_TUNER_ROOT}"  # Path to musubi-tuner repository
+
+# Project-relative paths
+dataset_dir = "./dataset"
+cache_dir = "./cache_directory"
+
+# ============================================
+# Dataset Curator Configuration
+# ============================================
+[dataset_curator]
+# Source directories to scan for movies
+source_directories = [
+    "/path/of/images/to/source" # only used if your run dataset_currator 
+]
+
+[dataset_curator.filters]
+year_range = [0000, 0000]
+countries = []
+genres = []
+keywords_include = []
+keywords_exclude = []  # Optional - add unwanted keywords here
+languages = ["en"]  # Optional - filter by original language
+
+[dataset_curator.sampling]
+mode = "all"  # Options: "all", "auto", "fixed"
+max_per_movie = 100
+min_per_movie = 1
+images_per_movie = 50  # Only used if mode = "fixed"
+
+[dataset_curator.options]
+prefix_with_movie_name = false
+
+# ============================================
+# Image Tagging Configuration
+# ============================================
+[tagging]
+# Ollama settings, most have Ollama setup already
+model = "llava:34b" # vision model of choice
+api_url = "http://localhost:11434" # set to your port ollama runs on
+temperature = 0.3 # 0.0 = deterministic 1.0 = creative
+
+# Image formats to process
+image_extensions = [".jpg", ".jpeg", ".png", ".webp"] # add whatever images your using
+
+# Caption settings
+trigger_word = ""  # Optional - prefix for all captions (e.g., "noir_style")
+overwrite_existing = false
+
+# Your custom prompt for the LLM
+prompt = """YOUR PROMPT FOR OLLAMA"""
+
+# ============================================
+# LoRA Training Configuration
+# ============================================
+[training]
+# Basic training parameters
+training_mode = "standard"    # Options: "standard", "edit", "edit_plus"
+learning_rate = "5e-5"
+network_dim = 32              # LoRA Rank (16, 32, 64)
+max_epochs = 16 
+save_every_n_epochs = 2
+seed = 42
+
+# Memory settings
+blocks_to_swap = 16           # Lower = faster, higher = less VRAM
+fp8_mode = "fp8_base"         # Options: fp8_base, fp8_scaled
+use_pinned_memory_for_block_swap = false  # May improve block swap performance (can cause issues on Windows)
+
+# Advanced settings
+optimizer = "adamw8bit"
+mixed_precision = "bf16"
+max_workers = 2
+discrete_flow_shift = 2.2
+
+[training.models]
+# Model filenames (will be found in models_root subdirectories)
+dit_model = "qwen_image_bf16.safetensors"
+vae_model = "diffusion_pytorch_model.safetensors"
+text_encoder = "qwen_2.5_vl_7b.safetensors"
+
+# Edit mode models (only used if training_mode = "edit" or "edit_plus")
+dit_model_edit = "qwen_image_edit_bf16.safetensors"
+dit_model_edit_plus = "qwen_image_edit_plus_bf16.safetensors"
+
+# ============================================
+# Advanced Training Options (Style Learning & Speed)
+# ============================================
+[training.advanced]
+# Checkpoint Resume (for interrupted training) CURRENTLY NOT WORING
+resume_from_checkpoint = ""           # Path to checkpoint to resume from (e.g., "./checkpoint-epoch-0008.safetensors")
+save_state = true                     # Save optimizer/scheduler state for resuming
+save_state_on_train_end = false       # Save state when training completes
+
+# Style Learning - helps model learn artistic styles better
+enable_sample_prompts = true
+sample_every_n_epochs = 2     # Every 2 epochs
+sample_every_n_steps = 0      # Or every N steps (don't use both)
+sample_at_first = true        # Generate samples before training
+sample_prompts = [
+    "TRIGGER_WORD PROMPT",
+    "TRIGGER_WORD PROMPT"
+]
+# IP-Adapter for style learning (requires IP-Adapter model)
+enable_ip_adapter = false
+ip_adapter_path = ""                  # Path to IP-Adapter model if used
+
+# Learning Rate Scheduling (helps with style convergence)
+lr_scheduler = ""                     # Options: "constant", "cosine", "cosine_with_restarts", "polynomial", "constant_with_warmup"
+lr_scheduler_num_cycles = 1           # For cosine_with_restarts
+lr_warmup_steps = 0                   # Warmup steps at start of training
+
+# Style Learning Enhancements
+min_snr_gamma = 0                     # Min SNR weighting (5-20 helps style learning, 0 = disabled)
+noise_offset = 0                      # Offset for noise (0.0-0.1 for dark/light styles, 0 = disabled)
+adaptive_noise_scale = 0              # Adaptive noise (0.0-1.0, 0 = disabled)
+
+# Style/Content Separation
+style_learning_rate_multiplier = 1.0  # Adjust if using style-specific training
+
+# Speed Optimizations
+cache_text_encoder_outputs = true     # Pre-cache text embeddings (recommended)
+cache_latents = true                  # Pre-cache VAE latents (recommended)
+persistent_data_loader_workers = true # Keep workers alive between epochs
+
+# Gradient Accumulation (train with less VRAM)
+gradient_accumulation_steps = 1       # Higher = less VRAM, slower training
+
+# Mixed Precision Training
+full_bf16 = false                     # Train entire model in bf16 (faster, less precise)
+full_fp16 = false                     # Train entire model in fp16 (faster, less precise)
+
+
+# Logging and Monitoring
+logging_dir = "./logs"                      # Directory for logs (empty = no logging)
+log_with = "tensorboard"                         # Options: "tensorboard", "wandb", ""
+log_prefix = "TRIGGER_WORD"                       # Prefix for log files
+
+# ============================================
+# Dataset Configuration (replaces separate .toml file)
+# ============================================
+[dataset]
+# General settings
+shuffle_caption = false
+caption_extension = ".txt"
+caption_dropout_rate = 0.0            # Randomly drop captions (0.0-1.0)
+caption_dropout_every_n_epochs = 0    # Drop captions every N epochs
+caption_tag_dropout_rate = 0.0        # Drop individual tags
+
+# Resolution and batching
+resolution = 1024           # Training resolution [width, height]
+batch_size = 1                        # Images per batch
+num_repeats = 1                       # Repeat dataset this many times per epoch
+
+# Bucketing (for varied aspect ratios)
+enable_bucket = false                 # Enable aspect ratio bucketing
+bucket_no_upscale = false              # Don't upscale images smaller than bucket size
+
+
+# Color augmentation (for style learning)
+color_aug = false                     # Enable color augmentation
+random_crop = false                   # Random crop instead of center crop
+flip_aug = false                      # Random horizontal flip
+
+
+# Dataset paths automatically use dataset_dir and cache_dir from [paths]
