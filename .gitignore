@@ -1,0 +1,23 @@
+# Ignore everything by default
+*
+
+# Track specific directories
+!.gitignore
+!./**
+!LORA_TEMPLATE
+!cache_vae
+!cache_text_encoder
+!lora_config_loader.py
+!train_lora
+!README.md
+
+
+
+# Exclude sensitive/cache data
+**/*.log
+**/*.bak
+**/*.backup
+**/cache/
+**/Cache/
+**/*password*
+**/*secret*

@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+LoRA Training
+Reads configuration from unified project.toml
+"""
+
+import os
+import sys
+import subprocess
+import argparse
+from pathlib import Path
+
+# Import the shared config loader
+try:
+    from lora_config_loader import load_config
+except ImportError:
+    print("âŒ Error: Cannot find lora_config_loader.py")
+    print("Make sure lora_config_loader.py is in the same directory or in your PYTHONPATH")
+    sys.exit(1)
+
+def train_lora(config):
+    """Run LoRA training with advanced options"""
+    
+    # Set memory management
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
+    # Get paths
+    musubi_root = config.musubi_tuner_root
+    dit_path = config.get_dit_model_for_mode()  # Now mode-aware
+    vae_path = config.get_model_path('vae')
+    text_encoder_path = config.get_model_path('text_encoder')
+    output_dir = config.get_output_dir()
+    
+    # Get training parameters
+    training = config.get('training', default={})
+    advanced = config.get('training', 'advanced', default={})
+    
+    training_mode = training.get('training_mode', 'standard')
+    learning_rate = training.get('learning_rate', '5e-5')
+    network_dim = training.get('network_dim', 32)
+    max_epochs = training.get('max_epochs', 16)
+    save_every_n_epochs = training.get('save_every_n_epochs', 2)
+    seed = training.get('seed', 42)
+    blocks_to_swap = training.get('blocks_to_swap', 20)
+    fp8_mode = training.get('fp8_mode', 'fp8_base')
+    use_pinned_memory = training.get('use_pinned_memory_for_block_swap', False)
+    optimizer = training.get('optimizer', 'adamw8bit')
+    mixed_precision = training.get('mixed_precision', 'bf16')
+    max_workers = training.get('max_workers', 2)
+    discrete_flow_shift = training.get('discrete_flow_shift', 2.2)
+    
+    print("â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”")
+    print("Starting LoRA Training...")
+    print("â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”")
+    print(f"Project: {config.project_name}")
+    print(f"Training Mode: {training_mode}")
+    print(f"DIT Model: {dit_path.name}")
+    print(f"Output: {output_dir}")
+    print(f"Epochs: {max_epochs}")
+    print(f"Learning Rate: {learning_rate}")
+    print(f"LoRA Rank: {network_dim}")
+    print(f"Blocks to Swap: {blocks_to_swap}")
+    print(f"FP8 Mode: {fp8_mode}")
+    if use_pinned_memory:
+        print(f"Pinned Memory: Enabled")
+    print(f"Musubi Tuner: {musubi_root}")
+    
+    # Show advanced options if enabled
+    if advanced.get('enable_sample_prompts'):
+        print(f"Sample Generation: Enabled (every {advanced.get('sample_every_n_epochs', 2)} epochs)")
+    if advanced.get('gradient_accumulation_steps', 1) > 1:
+        print(f"Gradient Accumulation: {advanced.get('gradient_accumulation_steps')} steps")
+    
+    print("")
+    
+    # Auto-generate dataset config from project.toml
+    print("Generating dataset configuration...")
+    dataset_config_path = config.write_dataset_config()
+    print(f"Dataset config: {dataset_config_path}")
+    print("")
+    
+    # Check if musubi-tuner exists
+    if not musubi_root.exists():
+        print(f"âŒ Error: Musubi-tuner directory not found: {musubi_root}")
+        print("Check your MUSUBI_TUNER_ROOT environment variable")
+        sys.exit(1)
+    
+    # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Build command
+    script_path = musubi_root / 'src/musubi_tuner/qwen_image_train_network.py'
+    if not script_path.exists():
+        print(f"âŒ Error: Script not found: {script_path}")
+        print("Make sure musubi_tuner_root is set correctly")
+        sys.exit(1)
+    
+    cmd = [
+        'accelerate', 'launch',
+        '--num_cpu_threads_per_process', '1',
+        '--mixed_precision', mixed_precision,
+        str(script_path),
+        '--dit', str(dit_path),
+        '--vae', str(vae_path),
+        '--text_encoder', str(text_encoder_path),
+        '--dataset_config', str(dataset_config_path),
+        '--sdpa',
+        '--mixed_precision', mixed_precision,
+        '--timestep_sampling', 'shift',
+        '--weighting_scheme', 'none',
+        '--discrete_flow_shift', str(discrete_flow_shift),
+        '--optimizer_type', optimizer,
+        '--learning_rate', str(learning_rate),
+        '--gradient_checkpointing',
+        '--max_data_loader_n_workers', str(max_workers),
+        '--network_module', 'networks.lora_qwen_image',
+        '--network_dim', str(network_dim),
+        '--blocks_to_swap', str(blocks_to_swap),
+        f'--{fp8_mode}',
+        '--max_train_epochs', str(max_epochs),
+        '--save_every_n_epochs', str(save_every_n_epochs),
+        '--seed', str(seed),
+        '--output_dir', str(output_dir),
+        '--output_name', config.project_name
+    ]
+    
+    # Add training mode flags (edit/edit_plus)
+    if training_mode == 'edit':
+        cmd.append('--edit')
+    elif training_mode == 'edit_plus':
+        cmd.append('--edit_plus')
+    # standard mode uses no additional flag
+    
+    # Add pinned memory flag if enabled
+    if use_pinned_memory:
+        cmd.append('--use_pinned_memory_for_block_swap')
+    
+    # Checkpoint resume options
+    resume_from = advanced.get('resume_from_checkpoint', '')
+    if resume_from:
+        # Musubi-tuner expects the path to the -state directory
+        # User provides base name (e.g., "noir-000008")
+        # We need to append "-state" to get the directory name
+        
+        # First, clean up anything user might have added
+        resume_from = resume_from.replace('.safetensors', '').replace('-state', '')
+        
+        # If it's a relative path, make it relative to output_dir
+        if not resume_from.startswith('/'):
+            resume_from = str(output_dir / resume_from)
+        
+        # Now add -state suffix for the directory
+        resume_from = f"{resume_from}-state"
+        
+        print(f"Resuming from checkpoint: {resume_from}")
+        print(f"Note: Display may show 'epoch 1' but will actually continue from checkpoint")
+        cmd.extend(['--resume', resume_from])
+    
+    if advanced.get('save_state', True):
+        cmd.append('--save_state')
+    
+    if advanced.get('save_state_on_train_end', False):
+        cmd.append('--save_state_on_train_end')
+    
+    # Add advanced options if enabled
+    
+    # Persistent data loader workers (recommended for speed)
+    if advanced.get('persistent_data_loader_workers', True):
+        cmd.append('--persistent_data_loader_workers')
+    
+    # Sample prompt generation
+    if advanced.get('enable_sample_prompts', False):
+        sample_prompts = advanced.get('sample_prompts', [])
+        
+        if sample_prompts:
+            # Write prompts to a text file (musubi-tuner reads from file, not command line)
+            sample_prompts_file = config.project_dir / 'sample_prompts.txt'
+            with open(sample_prompts_file, 'w') as f:
+                for prompt in sample_prompts:
+                    f.write(prompt + '\n')
+            
+            print(f"  ðŸ“¸ Sample generation enabled - prompts written to {sample_prompts_file}")
+            cmd.extend(['--sample_prompts', str(sample_prompts_file)])
+            
+            # Sampling frequency options (use epochs OR steps, not both)
+            sample_every_n_epochs = advanced.get('sample_every_n_epochs', 0)
+            sample_every_n_steps = advanced.get('sample_every_n_steps', 0)
+            
+            if sample_every_n_epochs > 0:
+                cmd.extend(['--sample_every_n_epochs', str(sample_every_n_epochs)])
+            elif sample_every_n_steps > 0:
+                cmd.extend(['--sample_every_n_steps', str(sample_every_n_steps)])
+            
+            # Sample before training starts
+            if advanced.get('sample_at_first', False):
+                cmd.append('--sample_at_first')
+        else:
+            print("  âš ï¸  enable_sample_prompts is true but no prompts specified")
+    
+    # IP-Adapter for style learning
+    if advanced.get('enable_ip_adapter', False):
+        ip_adapter_path = advanced.get('ip_adapter_path', '')
+        if ip_adapter_path:
+            cmd.extend(['--ip_adapter', ip_adapter_path])
+    
+    # Gradient accumulation
+    grad_accum = advanced.get('gradient_accumulation_steps', 1)
+    if grad_accum > 1:
+        cmd.extend(['--gradient_accumulation_steps', str(grad_accum)])
+    
+    # Full precision modes
+    if advanced.get('full_bf16', False):
+        cmd.append('--full_bf16')
+    elif advanced.get('full_fp16', False):
+        cmd.append('--full_fp16')
+    
+    # LR Scheduler (common for style learning)
+    lr_scheduler = advanced.get('lr_scheduler', None)
+    if lr_scheduler:
+        cmd.extend(['--lr_scheduler', lr_scheduler])
+        if lr_scheduler == 'cosine_with_restarts':
+            cmd.extend(['--lr_scheduler_num_cycles', str(advanced.get('lr_scheduler_num_cycles', 1))])
+        # Warmup steps
+        lr_warmup_steps = advanced.get('lr_warmup_steps', 0)
+        if lr_warmup_steps > 0:
+            cmd.extend(['--lr_warmup_steps', str(lr_warmup_steps)])
+    
+    # Min SNR Gamma (helps with style learning)
+    min_snr_gamma = advanced.get('min_snr_gamma', 0)
+    if min_snr_gamma > 0:
+        cmd.extend(['--min_snr_gamma', str(min_snr_gamma)])
+    
+    # Noise offset (can help with dark/light styles)
+    noise_offset = advanced.get('noise_offset', 0)
+    if noise_offset > 0:
+        cmd.extend(['--noise_offset', str(noise_offset)])
+    
+    # Adaptive noise scale
+    adaptive_noise_scale = advanced.get('adaptive_noise_scale', 0)
+    if adaptive_noise_scale > 0:
+        cmd.extend(['--adaptive_noise_scale', str(adaptive_noise_scale)])
+    
+    # Logging
+    logging_dir = advanced.get('logging_dir', '')
+    if logging_dir:
+        cmd.extend(['--logging_dir', logging_dir])
+    
+    log_with = advanced.get('log_with', '')
+    if log_with:
+        cmd.extend(['--log_with', log_with])
+    
+    log_prefix = advanced.get('log_prefix', '')
+    if log_prefix:
+        cmd.extend(['--log_prefix', log_prefix])
+    
+    print(f"Running training from: {musubi_root}")
+    print("")
+    
+    # Run the training script from musubi_tuner directory
+    try:
+        result = subprocess.run(cmd, cwd=str(musubi_root), check=True)
+        print("")
+        print("â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”")
+        print("âœ“ Training complete!")
+        print("â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”")
+        print(f"Your LoRA files are in: {output_dir}")
+        print(f"Model name: {config.project_name}")
+        print("")
+        return 0
+    except subprocess.CalledProcessError:
+        print("")
+        print("âŒ Training failed!")
+        return 1
+    except FileNotFoundError:
+        print("âŒ Error: accelerate not found or script missing")
+        print("Make sure accelerate is installed in your venv")
+        return 1
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Train LoRA (reads from project.toml)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+This script reads configuration from project.toml in the current directory.
+
+Usage:
+  # Navigate to your project directory
+  cd ~/lora_projects/noir
+  
+  # Train LoRA (automatically generates dataset config)
+  train_lora
+  
+  # Use different config file
+  train_lora --config ../other_project/project.toml
+
+The script now runs from your project directory - no need to cd to musubi_tuner!
+Advanced training options (sample generation, style learning, etc.) are configured
+in the [training.advanced] section of project.toml.
+        """
+    )
+    
+    parser.add_argument('-c', '--config', type=Path, default=None,
+                        help='Path to config file (default: ./project.toml)')
+    
+    args = parser.parse_args()
+    
+    # Load unified configuration
+    config = load_config(args.config)
+    
+    # Train LoRA
+    sys.exit(train_lora(config))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""
+Cache Text Encoder Outputs
+Reads configuration from unified project.toml
+"""
+
+import os
+import sys
+import subprocess
+import argparse
+from pathlib import Path
+
+# Import the shared config loader
+try:
+    from lora_config_loader import load_config
+except ImportError:
+    print("❌ Error: Cannot find lora_config_loader.py")
+    print("Make sure lora_config_loader.py is in the same directory or in your PYTHONPATH")
+    sys.exit(1)
+
+def cache_text_encoder(config):
+    """Cache text encoder outputs for training"""
+    
+    # Set memory management
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
+    # Get paths
+    musubi_root = config.musubi_tuner_root
+    text_encoder_path = config.get_model_path('text_encoder')
+    
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("Caching Text Encoder Outputs...")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Project: {config.project_name}")
+    print(f"Text Encoder: {text_encoder_path.name}")
+    print(f"Musubi Tuner: {musubi_root}")
+    print("")
+    
+    # Auto-generate dataset config from project.toml
+    print("Generating dataset configuration...")
+    dataset_config_path = config.write_dataset_config()
+    print(f"Dataset config: {dataset_config_path}")
+    print("")
+    
+    # Check if musubi-tuner exists
+    if not musubi_root.exists():
+        print(f"❌ Error: Musubi-tuner directory not found: {musubi_root}")
+        print("Check your MUSUBI_TUNER_ROOT environment variable")
+        sys.exit(1)
+    
+    # Build command - run from musubi_tuner directory
+    script_path = musubi_root / 'src/musubi_tuner/qwen_image_cache_text_encoder_outputs.py'
+    if not script_path.exists():
+        print(f"❌ Error: Script not found: {script_path}")
+        print("Make sure musubi_tuner_root is set correctly")
+        sys.exit(1)
+    
+    cmd = [
+        'python', str(script_path),
+        '--dataset_config', str(dataset_config_path),
+        '--text_encoder', str(text_encoder_path),
+        '--batch_size', '1',
+        '--num_workers', '1'
+    ]
+    
+    # Run the caching script from musubi_tuner directory
+    try:
+        result = subprocess.run(cmd, cwd=str(musubi_root), check=True)
+        print("")
+        print("✓ Text encoder outputs cached successfully!")
+        return 0
+    except subprocess.CalledProcessError:
+        print("")
+        print("❌ Text encoder caching failed!")
+        return 1
+    except FileNotFoundError:
+        print("❌ Error: Python not found or script missing")
+        return 1
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Cache text encoder outputs (reads from project.toml)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+This script reads configuration from project.toml in the current directory.
+
+Usage:
+  # Navigate to your project directory
+  cd ~/lora_projects/noir
+  
+  # Cache text encoder outputs (automatically generates dataset config)
+  cache_text_encoder
+  
+  # Use different config file
+  cache_text_encoder --config ../other_project/project.toml
+
+The script now runs from your project directory - no need to cd to musubi_tuner!
+        """
+    )
+    
+    parser.add_argument('-c', '--config', type=Path, default=None,
+                        help='Path to config file (default: ./project.toml)')
+    
+    args = parser.parse_args()
+    
+    # Load unified configuration
+    config = load_config(args.config)
+    
+    # Cache text encoder
+    sys.exit(cache_text_encoder(config))
+
+if __name__ == "__main__":
+    main()
