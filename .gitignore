@@ -14,7 +14,8 @@
 !lora_config_loader.py
 !train_lora
 !README.md
-
+!tag_images
+!dataset_curator
 
 
 # Exclude sensitive/cache data

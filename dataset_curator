@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+Dataset Curator
+Pulls images from movie folders based on metadata queries
+Now reads from unified project.toml configuration
+"""
+
+import os
+import sys
+import json
+import shutil
+import argparse
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+
+# Import the shared config loader
+try:
+    from lora_config_loader import load_config
+except ImportError:
+    print("❌ Error: Cannot find lora_config_loader.py")
+    print("Make sure lora_config_loader.py is in the same directory or in your PYTHONPATH")
+    sys.exit(1)
+
+def load_movie_metadata(movie_folder):
+    """Load .movie_metadata.json from a movie folder."""
+    metadata_file = movie_folder / '.movie_metadata.json'
+    
+    if not metadata_file.exists():
+        return None
+    
+    try:
+        with open(metadata_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        return None
+
+def matches_filters(metadata, filters):
+    """Check if movie metadata matches all filter criteria."""
+    if not metadata:
+        return False
+    
+    # Year range filter
+    if 'year_range' in filters and filters['year_range']:
+        year = metadata.get('year')
+        if not year:
+            return False
+        min_year, max_year = filters['year_range']
+        if year < min_year or year > max_year:
+            return False
+    
+    # Countries filter (movie must be from at least one of these countries)
+    if 'countries' in filters and filters['countries']:
+        movie_countries = metadata.get('countries', [])
+        if not movie_countries:
+            return False
+        # Check if any movie country matches any filter country
+        if not any(country in filters['countries'] for country in movie_countries):
+            return False
+    
+    # Genres filter (movie must have at least one of these genres)
+    if 'genres' in filters and filters['genres']:
+        movie_genres = metadata.get('genres', [])
+        if not movie_genres:
+            return False
+        if not any(genre in filters['genres'] for genre in movie_genres):
+            return False
+    
+    # Keywords include (movie must have at least one of these keywords)
+    if 'keywords_include' in filters and filters['keywords_include']:
+        movie_keywords = metadata.get('keywords', [])
+        if not movie_keywords:
+            return False
+        # Case-insensitive matching
+        movie_keywords_lower = [kw.lower() for kw in movie_keywords]
+        filter_keywords_lower = [kw.lower() for kw in filters['keywords_include']]
+        if not any(kw in movie_keywords_lower for kw in filter_keywords_lower):
+            return False
+    
+    # Keywords exclude (movie must NOT have any of these keywords)
+    if 'keywords_exclude' in filters and filters['keywords_exclude']:
+        movie_keywords = metadata.get('keywords', [])
+        if movie_keywords:
+            movie_keywords_lower = [kw.lower() for kw in movie_keywords]
+            filter_keywords_lower = [kw.lower() for kw in filters['keywords_exclude']]
+            if any(kw in movie_keywords_lower for kw in filter_keywords_lower):
+                return False
+    
+    # Original language filter
+    if 'languages' in filters and filters['languages']:
+        movie_lang = metadata.get('original_language')
+        if not movie_lang or movie_lang not in filters['languages']:
+            return False
+    
+    return True
+
+def get_movie_images(movie_folder, image_extensions=['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']):
+    """Get all image files from a movie folder."""
+    images = []
+    for ext in image_extensions:
+        images.extend(list(movie_folder.glob(f'*{ext}')))
+    return sorted(images)
+
+def sample_images(images, sampling_config, movie_name):
+    """Sample images from a movie based on sampling configuration."""
+    total_images = len(images)
+    
+    if total_images == 0:
+        return []
+    
+    # Get sampling parameters
+    mode = sampling_config.get('mode', 'auto')
+    max_per_movie = sampling_config.get('max_per_movie', 100)
+    min_per_movie = sampling_config.get('min_per_movie', 20)
+    images_per_movie = sampling_config.get('images_per_movie', None)
+    
+    # Determine how many images to take
+    if mode == 'all':
+        # Take all images (up to max)
+        num_to_take = min(total_images, max_per_movie)
+    elif mode == 'fixed' and images_per_movie:
+        # Take exactly this many (if available)
+        num_to_take = min(images_per_movie, total_images, max_per_movie)
+    else:  # 'auto' or default
+        # Auto-scale based on total images, respecting min/max
+        num_to_take = min(max(total_images, min_per_movie), max_per_movie)
+    
+    # Skip movies with too few images
+    if total_images < min_per_movie:
+        print(f"    Skipping {movie_name}: only {total_images} images (min: {min_per_movie})")
+        return []
+    
+    # Sample evenly spaced images
+    if num_to_take >= total_images:
+        return images
+    
+    # Calculate step size for even spacing
+    step = total_images / num_to_take
+    sampled_indices = [int(i * step) for i in range(num_to_take)]
+    sampled_images = [images[i] for i in sampled_indices]
+    
+    return sampled_images
+
+def copy_images_to_dataset(images, dataset_dir, prefix="", dry_run=False):
+    """Copy images to dataset directory with optional prefix."""
+    copied = 0
+    
+    for img_path in images:
+        # Create new filename with prefix
+        new_name = f"{prefix}{img_path.name}" if prefix else img_path.name
+        dest_path = dataset_dir / new_name
+        
+        # Handle filename conflicts
+        counter = 1
+        original_dest = dest_path
+        while dest_path.exists() and not dry_run:
+            stem = original_dest.stem
+            suffix = original_dest.suffix
+            dest_path = dataset_dir.parent / dataset_dir.name / f"{stem}_{counter}{suffix}"
+            counter += 1
+        
+        try:
+            if not dry_run:
+                shutil.copy2(img_path, dest_path)
+            copied += 1
+        except Exception as e:
+            print(f"      Error copying {img_path.name}: {e}")
+    
+    return copied
+
+def scan_source_directories(source_dirs):
+    """Scan source directories for movie folders with metadata."""
+    all_movie_folders = []
+    
+    for source_dir in source_dirs:
+        source_path = Path(source_dir).expanduser()
+        
+        if not source_path.exists():
+            print(f"Warning: Source directory does not exist: {source_dir}")
+            continue
+        
+        # Find all subdirectories (movie folders)
+        movie_folders = [d for d in source_path.iterdir() if d.is_dir()]
+        all_movie_folders.extend(movie_folders)
+    
+    return all_movie_folders
+
+def create_dataset(config, dry_run=False, verbose=False):
+    """Create a dataset based on unified configuration."""
+    # Extract config sections from unified config
+    curator_config = config.get_curator_config()
+    
+    dataset_name = curator_config['dataset_name']
+    output_dir = Path(curator_config['output_dir'])
+    source_dirs = curator_config['source_directories']
+    filters = curator_config['filters']
+    sampling = curator_config['sampling']
+    options = curator_config['options']
+    
+    # Validate source directories
+    if not source_dirs:
+        print("❌ Error: No source directories specified in config")
+        sys.exit(1)
+    
+    print(f"\n{'='*70}")
+    print(f"Dataset Curator: {dataset_name}")
+    print(f"{'='*70}")
+    if dry_run:
+        print("DRY RUN - No files will be copied\n")
+    
+    # Create output directory
+    if not dry_run and not output_dir.exists():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Created output directory: {output_dir}\n")
+    
+    # Scan for movie folders
+    print("Scanning source directories...")
+    movie_folders = scan_source_directories(source_dirs)
+    print(f"Found {len(movie_folders)} total movie folders\n")
+    
+    # Filter and process movies
+    print("Filtering movies based on criteria...")
+    
+    stats = {
+        'total_scanned': len(movie_folders),
+        'no_metadata': 0,
+        'filtered_out': 0,
+        'matched': 0,
+        'skipped_too_few': 0,
+        'total_images_copied': 0
+    }
+    
+    matched_movies = []
+    
+    for movie_folder in movie_folders:
+        # Load metadata
+        metadata = load_movie_metadata(movie_folder)
+        
+        if not metadata:
+            stats['no_metadata'] += 1
+            continue
+        
+        # Check filters
+        if not matches_filters(metadata, filters):
+            stats['filtered_out'] += 1
+            continue
+        
+        # Movie matches!
+        stats['matched'] += 1
+        movie_name = movie_folder.name
+        
+        print(f"\n  ✓ {movie_name}")
+        if verbose:
+            print(f"    Year: {metadata.get('year')}")
+            print(f"    Countries: {', '.join(metadata.get('countries', []))}")
+            print(f"    Genres: {', '.join(metadata.get('genres', []))}")
+        
+        # Get images
+        images = get_movie_images(movie_folder)
+        print(f"    Found {len(images)} images")
+        
+        # Sample images
+        sampled_images = sample_images(images, sampling, movie_name)
+        
+        if not sampled_images:
+            stats['skipped_too_few'] += 1
+            continue
+        
+        print(f"    Selected {len(sampled_images)} images")
+        
+        # Copy images
+        prefix = f"{movie_name}_" if options.get('prefix_with_movie_name', False) else ""
+        
+        if not dry_run:
+            copied = copy_images_to_dataset(sampled_images, output_dir, prefix, dry_run)
+            stats['total_images_copied'] += copied
+            print(f"    Copied {copied} images")
+        else:
+            stats['total_images_copied'] += len(sampled_images)
+            print(f"    Would copy {len(sampled_images)} images")
+        
+        matched_movies.append({
+            'name': movie_name,
+            'year': metadata.get('year'),
+            'countries': metadata.get('countries', []),
+            'genres': metadata.get('genres', []),
+            'images_selected': len(sampled_images)
+        })
+    
+    # Print summary
+    print(f"\n{'='*70}")
+    print("DATASET CREATION COMPLETE")
+    print(f"{'='*70}")
+    print(f"Total folders scanned: {stats['total_scanned']}")
+    print(f"No metadata: {stats['no_metadata']}")
+    print(f"Filtered out: {stats['filtered_out']}")
+    print(f"Matched criteria: {stats['matched']}")
+    print(f"Skipped (too few images): {stats['skipped_too_few']}")
+    print(f"Total images {'would be copied' if dry_run else 'copied'}: {stats['total_images_copied']}")
+    print(f"{'='*70}")
+    
+    # Save dataset info
+    if not dry_run and matched_movies:
+        info_file = output_dir / 'dataset_info.json'
+        dataset_info = {
+            'dataset_name': dataset_name,
+            'created_at': datetime.now().isoformat(),
+            'config_used': curator_config,
+            'statistics': stats,
+            'movies_included': matched_movies
+        }
+        
+        try:
+            with open(info_file, 'w', encoding='utf-8') as f:
+                json.dump(dataset_info, f, indent=2, ensure_ascii=False)
+            print(f"\nDataset info saved to: {info_file}")
+        except Exception as e:
+            print(f"\nWarning: Could not save dataset info: {e}")
+    
+    print(f"{'='*70}\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Curate image datasets from movie collections (reads from project.toml)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+This script now reads configuration from project.toml in the current directory.
+
+Usage:
+  # Navigate to your project directory
+  cd ~/lora_projects/noir
+  
+  # Dry run to preview
+  dataset_curator --dry-run
+  
+  # Actually create dataset
+  dataset_curator
+  
+  # Verbose output
+  dataset_curator --verbose
+  
+  # Use different config file
+  dataset_curator --config ../other_project/project.toml
+        """
+    )
+    
+    parser.add_argument('-c', '--config', type=Path, default=None,
+                        help='Path to config file (default: ./project.toml)')
+    parser.add_argument('-d', '--dry-run', action='store_true',
+                        help='Preview what would be copied without actually copying')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show detailed information for each movie')
+    
+    args = parser.parse_args()
+    
+    # Load unified configuration
+    config = load_config(args.config)
+    config.print_summary("Dataset Curator")
+    
+    # Create the dataset
+    create_dataset(config, dry_run=args.dry_run, verbose=args.verbose)
+
+if __name__ == "__main__":
+    main()

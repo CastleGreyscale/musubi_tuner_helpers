@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+Image Tagging with Ollama
+Uses Ollama directly to generate captions
+Now reads from unified project.toml configuration
+"""
+
+import base64
+import requests
+from pathlib import Path
+import sys
+from typing import Optional
+import argparse
+
+# Import the shared config loader
+try:
+    from lora_config_loader import load_config
+except ImportError:
+    print("❌ Error: Cannot find lora_config_loader.py")
+    print("Make sure lora_config_loader.py is in the same directory or in your PYTHONPATH")
+    sys.exit(1)
+
+def encode_image(image_path: Path) -> str:
+    """Encode image to base64"""
+    with open(image_path, 'rb') as f:
+        return base64.b64encode(f.read()).decode('utf-8')
+
+def generate_caption(
+    image_base64: str,
+    prompt: str,
+    model: str,
+    api_url: str,
+    temperature: float
+) -> Optional[str]:
+    """Call Ollama API to generate caption"""
+    try:
+        response = requests.post(
+            f"{api_url}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "images": [image_base64],
+                "stream": False,
+                "options": {
+                    "temperature": temperature
+                }
+            },
+            timeout=120
+        )
+        response.raise_for_status()
+        return response.json().get('response', '').strip()
+    except Exception as e:
+        print(f"  ❌ API Error: {e}")
+        return None
+
+def tag_dataset(config, overwrite: Optional[bool] = None):
+    """Tag all images in the dataset directory"""
+    
+    # Get tagging configuration
+    tagging = config.get('tagging', default={})
+    
+    image_dir = config.dataset_dir
+    image_extensions = tagging.get('image_extensions', ['.jpg', '.jpeg', '.png', '.webp'])
+    caption_prompt = tagging.get('prompt', '')
+    trigger_word = tagging.get('trigger_word', '')
+    model = tagging.get('model', 'llava:34b')
+    api_url = tagging.get('api_url', 'http://localhost:11434')
+    temperature = tagging.get('temperature', 0.3)
+    
+    # Allow command line override of overwrite setting
+    if overwrite is None:
+        overwrite = tagging.get('overwrite_existing', False)
+    
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("Image Tagging with Ollama")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Project: {config.project_name}")
+    print(f"Dataset: {image_dir}")
+    print(f"Model: {model}")
+    print(f"Trigger word: {trigger_word if trigger_word else '(none)'}")
+    print(f"Overwrite existing: {overwrite}")
+    print("")
+    
+    # Check if dataset directory exists
+    if not image_dir.exists():
+        print(f"❌ Dataset directory not found: {image_dir}")
+        print("Run dataset_curator first to create the dataset.")
+        sys.exit(1)
+    
+    # Check Ollama connection
+    try:
+        requests.get(f"{api_url}/api/tags", timeout=5)
+        print("✓ Connected to Ollama\n")
+    except:
+        print(f"❌ Cannot connect to Ollama at {api_url}")
+        print("Make sure Ollama is running: ollama serve")
+        sys.exit(1)
+    
+    # Find all images
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(image_dir.glob(f"**/*{ext}"))
+        # Case insensitive
+        image_files.extend(image_dir.glob(f"**/*{ext.upper()}"))
+    
+    image_files = sorted(set(image_files))  # Remove duplicates and sort
+    total_images = len(image_files)
+    
+    if total_images == 0:
+        print(f"❌ No images found in {image_dir}")
+        sys.exit(1)
+    
+    print(f"Found {total_images} images to process\n")
+    
+    # Process each image
+    processed = 0
+    skipped = 0
+    failed = 0
+    
+    for idx, image_path in enumerate(image_files, 1):
+        caption_path = image_path.with_suffix('.txt')
+        
+        # Skip if caption exists and overwrite is false
+        if caption_path.exists() and not overwrite:
+            skipped += 1
+            print(f"[{idx}/{total_images}] ⊘ Skipping (caption exists): {image_path.name}")
+            continue
+        
+        print(f"[{idx}/{total_images}] Processing: {image_path.name}")
+        
+        # Encode image
+        try:
+            image_base64 = encode_image(image_path)
+        except Exception as e:
+            failed += 1
+            print(f"  ❌ Failed to encode image: {e}")
+            continue
+        
+        # Generate caption
+        caption = generate_caption(
+            image_base64,
+            caption_prompt,
+            model,
+            api_url,
+            temperature
+        )
+        
+        if not caption:
+            failed += 1
+            print("  ❌ Failed to generate caption")
+            continue
+        
+        # Add trigger word prefix if specified
+        if trigger_word:
+            caption = f"{trigger_word} {caption}"
+        
+        # Save caption
+        try:
+            caption_path.write_text(caption, encoding='utf-8')
+            preview = caption[:60] + "..." if len(caption) > 60 else caption
+            print(f"  ✓ Caption saved: {preview}")
+            processed += 1
+        except Exception as e:
+            failed += 1
+            print(f"  ❌ Failed to save caption: {e}")
+    
+    # Summary
+    print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("Tagging Complete!")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Total images: {total_images}")
+    print(f"Successfully tagged: {processed}")
+    print(f"Skipped (existing): {skipped}")
+    print(f"Failed: {failed}\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Tag images using Ollama (reads from project.toml)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+This script reads configuration from project.toml in the current directory.
+
+Usage:
+  # Navigate to your project directory
+  cd ~/lora_projects/noir
+  
+  # Tag all images
+  tag_images
+  
+  # Force overwrite existing captions
+  tag_images --overwrite
+  
+  # Use different config file
+  tag_images --config ../other_project/project.toml
+        """
+    )
+    
+    parser.add_argument('-c', '--config', type=Path, default=None,
+                        help='Path to config file (default: ./project.toml)')
+    parser.add_argument('-o', '--overwrite', action='store_true',
+                        help='Overwrite existing caption files')
+    
+    args = parser.parse_args()
+    
+    # Load unified configuration
+    config = load_config(args.config)
+    
+    # Tag the dataset
+    tag_dataset(config, overwrite=args.overwrite)
+
+if __name__ == "__main__":
+    main()
